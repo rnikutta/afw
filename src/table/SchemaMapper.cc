@@ -126,7 +126,7 @@ SchemaMapper::SchemaMapper(Schema const & input, Schema const & output) :
 {}
 
 SchemaMapper::SchemaMapper(Schema const & input) :
-    _impl(new Impl(input, Schema(input.getVersion())))
+    _impl(new Impl(input, Schema()))
 {}
 
 SchemaMapper & SchemaMapper::operator=(SchemaMapper const & other) {
