@@ -107,7 +107,8 @@ protected:
 PTR(BaseTable) AmpInfoFitsReader::_readTable() {
     PTR(daf::base::PropertyList) metadata = boost::make_shared<daf::base::PropertyList>();
     _fits->readMetadata(*metadata, true);
-    Schema schema(*metadata, true);
+    Schema schema;
+    _fields = _readSchema(schema, *metadata, true);
     PTR(AmpInfoTable) table = AmpInfoTable::make(schema);
     table->setMetadata(metadata);
     _startRecords(*table);

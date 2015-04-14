@@ -9,6 +9,9 @@
 
 namespace lsst { namespace afw { namespace table { namespace io {
 
+/// Helper class used by FitsReader; not private so classes in anonymous namespaces can see it.
+class FieldReader;
+
 /**
  *  @brief A Reader subclass for FITS binary tables.
  *
@@ -114,6 +117,8 @@ public:
      */
     explicit FitsReader(Fits * fits, PTR(InputArchive), int flags) : _fits(fits), _flags(flags) {}
 
+    ~FitsReader(); // needs to go in .cc so it can see FieldReader dtor
+
 protected:
 
     /// @copydoc Reader::_readTable
@@ -130,20 +135,22 @@ protected:
     Fits * _fits;         // cfitsio pointer in a conveniencer wrapper
     int _flags;           // subclass-defined flags to control FITS reading
     std::size_t _row;     // which row we're currently reading
-private:
 
-    friend class afw::table::Schema;
+    typedef std::vector<PTR(FieldReader)> FieldReaderVector;
 
     // Implementation for Schema's constructors that take PropertyLists;
     // it's here to keep FITS-related code a little more centralized.
-    static void _readSchema(
+    static FieldReaderVector _readSchema(
         Schema & schema,
         daf::base::PropertyList & metadata,
         bool stripMetadata
     );
 
+    friend class afw::table::Schema;
+
+    FieldReaderVector _fields;
+
     std::size_t _nRows;   // how many total records there are in the FITS table
-    boost::shared_ptr<ProcessRecords> _processor; // a private Schema::forEach functor that reads records
 };
 
 }}}} // namespace lsst::afw::table::io

@@ -306,7 +306,8 @@ PTR(BaseTable) SourceFitsReader::_readTable() {
         --_heavyMaskCol;
         --_heavyVarCol;
     }
-    Schema schema(*metadata, true);
+    Schema schema;
+    _fields = _readSchema(schema, *metadata, true);
     if (archiveHdu > 0) {
         // If an archive was present, regardless of whether or not we actually read it, the Schema we just
         // constructed has an extra int field holding the Footprint archive IDs.

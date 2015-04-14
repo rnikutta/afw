@@ -219,7 +219,9 @@ protected:
 PTR(BaseTable) ExposureFitsReader::_readTable() {
     PTR(daf::base::PropertyList) metadata = boost::make_shared<daf::base::PropertyList>();
     _fits->readMetadata(*metadata, true);
-    Schema schema(*metadata, true);
+
+    Schema schema;
+    _fields = _readSchema(schema, *metadata, true);
     _inTable = BaseTable::make(schema);
     _mapper = PersistenceSchema::get().makeReadMapper(schema);
     PTR(ExposureTable) table = ExposureTable::make(_mapper.getOutputSchema());

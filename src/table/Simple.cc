@@ -109,8 +109,9 @@ protected:
 PTR(BaseTable) SimpleFitsReader::_readTable() {
     PTR(daf::base::PropertyList) metadata = boost::make_shared<daf::base::PropertyList>();
     _fits->readMetadata(*metadata, true);
-    Schema schema(*metadata, true);
-    PTR(SimpleTable) table =  SimpleTable::make(schema, PTR(IdFactory)());
+    Schema schema;
+    _fields = _readSchema(schema, *metadata, true);
+    PTR(BaseTable) table = SimpleTable::make(schema);
     table->setMetadata(metadata);
     _startRecords(*table);
     return table;

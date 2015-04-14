@@ -17,15 +17,132 @@
 
 namespace lsst { namespace afw { namespace table { namespace io {
 
-namespace {
-
-typedef FitsReader::Fits Fits;
-
 /*
  *  This file contains most of the code for reading FITS binary tables.  There's also a little
  *  in Source.cc, where we read the stuff that's specific to SourceTable/SourceRecord (footprints
  *  and aliases).
  */
+
+class FieldReader {
+public:
+
+    FieldReader() {}
+
+    // Neither copyable nor moveable.
+    FieldReader(FieldReader const &) = delete;
+    FieldReader(FieldReader &&) = delete;
+    FieldReader & operator=(FieldReader const &) = delete;
+    FieldReader & operator=(FieldReader &&) = delete;
+
+    virtual void readCell(
+        std::size_t row, BaseRecord & record,
+        fits::Fits & fits, boost::scoped_array<bool> const & flagData
+    ) const = 0;
+
+    virtual ~FieldReader() {}
+
+};
+
+namespace {
+
+typedef FitsReader::Fits Fits;
+
+template <typename T>
+class StandardReader : public FieldReader {
+public:
+
+    StandardReader(
+        std::size_t col, Schema & schema,
+        std::string const & name, std::string const & doc, std::string const & unit,
+        FieldBase<T> const & base = FieldBase<T>()
+    ) :
+        _col(col), _key(schema.addField<T>(name, doc, unit, base))
+    {}
+
+    virtual void readCell(
+        std::size_t row, BaseRecord & record,
+        Fits & fits, boost::scoped_array<bool> const & flagData
+    ) const {
+        fits.readTableArray(row, _col, _key.getElementCount(), record.getElement(_key));
+    }
+
+private:
+    std::size_t _col;
+    Key<T> _key;
+};
+
+class StringReader : public FieldReader {
+public:
+
+    StringReader(
+        std::size_t col, Schema & schema,
+        std::string const & name, std::string const & doc, std::string const & unit,
+        int size
+    ) :
+        _col(col), _key(schema.addField<std::string>(name, doc, unit, size))
+    {}
+
+    virtual void readCell(
+        std::size_t row, BaseRecord & record,
+        Fits & fits, boost::scoped_array<bool> const & flagData
+    ) const {
+        std::string s;
+        fits.readTableScalar(row, _col, s);
+        record.set(_key, s);
+    }
+
+private:
+    std::size_t _col;
+    Key<std::string> _key;
+};
+
+class FlagReader : public FieldReader {
+public:
+
+    FlagReader(
+        std::size_t  bit, Schema & schema,
+        std::string const & name, std::string const & doc
+    ) :
+        _bit(bit), _key(schema.addField<Flag>(name, doc))
+    {}
+
+    virtual void readCell(
+        std::size_t row, BaseRecord & record,
+        Fits & fits, boost::scoped_array<bool> const & flagData
+    ) const {
+        record.set(_key, flagData[_bit]);
+    }
+
+private:
+    std::size_t _bit;
+    Key<Flag> _key;
+};
+
+template <typename T>
+class VariableLengthArrayReader : public FieldReader {
+public:
+
+    VariableLengthArrayReader(
+        std::size_t col, Schema & schema,
+        std::string const & name, std::string const & doc, std::string const & unit
+    ) :
+        _col(col), _key(schema.addField<Array<T>>(name, doc, unit, 0))
+    {}
+
+    virtual void readCell(
+        std::size_t row, BaseRecord & record,
+        Fits & fits, boost::scoped_array<bool> const & flagData
+    ) const {
+        int size = fits.getTableArraySize(row, _col);
+        ndarray::Array<T,1,1> array = ndarray::allocate(size);
+        fits.readTableArray(row, _col, size, array.getData());
+        record.set(_key, array);
+    }
+
+private:
+    std::size_t _col;
+    Key<Array<T>> _key;
+};
 
 // ------------ FITS header to Schema implementation -------------------------------------------------------
 
@@ -49,7 +166,7 @@ struct FitsSchemaItem {
     std::string cls;     // which field class to use (from our own TCCLS keys)
 
     // Add the field defined by the strings to a schema.
-    void addField(Schema & schema) const {
+    PTR(FieldReader) addField(Schema & schema) const {
         static boost::regex const regex("(\\d+)?([PQ])?(\\u)\\(?(\\d)*\\)?", boost::regex::perl);
         // start by parsing the format; this tells the element type of the field and the number of elements
         boost::smatch m;
@@ -75,49 +192,51 @@ struct FitsSchemaItem {
                   // that's all we ever write, and CFITSIO will complain later if they aren't)
             if (size == 1) {
                 if (cls == "Array") {
-                    schema.addField< Array<boost::uint16_t> >(name, doc, units, size);
-                } else {
-                    schema.addField<boost::uint16_t>(name, doc, units);
+                    return boost::make_shared<StandardReader<Array<boost::uint16_t>>>(
+                        col, schema, name, doc, units, size
+                    );
                 }
-            } else {
-                schema.addField< Array<boost::uint16_t> >(name, doc, units, size);
+                return boost::make_shared<StandardReader<boost::uint16_t>>(col, schema, name, doc, units);
             }
-            break;
-        case 'J': // 32-bit integers - can only be scalars, Point fields, or Arrays
-            if (size == 1) {
-                if (cls == "Array") {
-                    schema.addField< Array<boost::int32_t> >(name, doc, units, size);
-                } else {
-                    schema.addField<boost::int32_t>(name, doc, units);
-                }
-            } else if (size == 2) {
-                if (cls == "Array") {
-                    schema.addField< Array<boost::int32_t> >(name, doc, units, size);
-                } else {
-                    schema.addField< Point<boost::int32_t> >(name, doc, units);
-                }
-            } else {
-                schema.addField< Array<boost::int32_t> >(name, doc, units, size);
-            }
-            break;
-        case 'K': // 64-bit integers - can only be scalars.
-            if (size != 1) {
-                throw LSST_EXCEPT(
-                    afw::fits::FitsError,
-                    (boost::format("Unsupported FITS column type: '%s'.") % format).str()
+            if (size == 0) {
+                return boost::make_shared<VariableLengthArrayReader<boost::uint16_t>>(
+                    col, schema, name, doc, units
                 );
             }
-            schema.addField<boost::int64_t>(name, doc, units);
-            break;
+            return boost::make_shared<StandardReader<Array<boost::uint16_t>>>(
+                col, schema, name, doc, units, size
+            );
+        case 'J': // 32-bit integers - can only be scalars, Point fields, or Arrays
+            if (size == 0) {
+                return boost::make_shared<VariableLengthArrayReader<boost::int32_t>>(
+                    col, schema, name, doc, units
+                );
+            }
+            if (cls == "Point") {
+                return boost::make_shared<StandardReader<Point<boost::int32_t>>>(
+                    col, schema, name, doc, units
+                );
+            }
+            if (size > 1 || cls == "Array") {
+                return boost::make_shared<StandardReader<Array<boost::int32_t>>>(
+                    col, schema, name, doc, units, size
+                );
+            }
+            return boost::make_shared<StandardReader<boost::int32_t>>(
+                col, schema, name, doc, units
+            );
+        case 'K': // 64-bit integers - can only be scalars.
+            if (size == 1) {
+                return boost::make_shared<StandardReader<boost::int64_t>>(
+                    col, schema, name, doc, units
+                );
+            }
         case 'E': // floats and doubles can be any number of things; delegate to a separate function
-            addFloatField<float>(schema, size);
-            break;
+            return addFloatField<float>(schema, size);
         case 'D':
-            addFloatField<double>(schema, size);
-            break;
+            return addFloatField<double>(schema, size);
         case 'A': // strings
-            schema.addField<std::string>(name, doc, units, size);
-            break;
+            return boost::make_shared<StringReader>(col, schema, name, doc, units, size);
         default:
             // We throw if we encounter a column type we can't handle.
             // This raises probem when we want to save footprints as variable length arrays
@@ -132,40 +251,46 @@ struct FitsSchemaItem {
 
     // Add a field with a float or double element type to the schema.
     template <typename U>
-    void addFloatField(Schema & schema, int size) const {
+    PTR(FieldReader) addFloatField(Schema & schema, int size) const {
+        if (size == 0) {
+            return boost::make_shared<VariableLengthArrayReader<U>>(
+                col, schema, name, doc, units
+            );
+        }
         if (size == 1) {
             if (cls == "Angle") {
-                schema.addField< Angle >(name, doc, units);
-            } else if (cls == "Array") {
-                schema.addField< Array<U> >(name, doc, units, 1);
-            } else if (cls == "Covariance") {
-                schema.addField< Covariance<float> >(name, doc, units, 1);
-            } else {
-                schema.addField<U>(name, doc, units);
+                return boost::make_shared<StandardReader<Angle>>(col, schema, name, doc, units);
             }
-            return;
+            if (cls == "Array") {
+                return boost::make_shared<StandardReader<Array<U>>>(col, schema, name, doc, units, 1);
+            }
+            if (cls == "Covariance") {
+                return boost::make_shared<StandardReader<Covariance<float>>>(
+                    col, schema, name, doc, units, 1
+                );
+            }
+            return boost::make_shared<StandardReader<U>>(col, schema, name, doc, units);
         } else if (size == 2) {
             if (cls == "Point") {
-                schema.addField< Point<double> >(name, doc, units);
-                return;
+                return boost::make_shared<StandardReader<Point<double>>>(col, schema, name, doc, units);
             }
             if (cls == "Coord") {
-                schema.addField< Coord >(name, doc, units);
-                return;
+                return boost::make_shared<StandardReader<Coord>>(col, schema, name, doc, units);
             }
         } else if (size == 3) {
             if (cls == "Moments") {
-                schema.addField< Moments<double> >(name, doc, units);
-                return;
+                return boost::make_shared<StandardReader<Moments<double>>>(col, schema, name, doc, units);
             }
             if (cls == "Covariance(Point)") {
-                schema.addField< Covariance< Point<float> > >(name, doc, units);
-                return;
+                return boost::make_shared<StandardReader<Covariance<Point<float>>>>(
+                    col, schema, name, doc, units
+                );
             }
         } else if (size == 6) {
             if (cls == "Covariance(Moments)") {
-                schema.addField< Covariance< Moments<float> > >(name, doc, units);
-                return;
+                return boost::make_shared<StandardReader<Covariance<Moments<float>>>>(
+                    col, schema, name, doc, units
+                );
             }
         }
         if (cls == "Covariance") {
@@ -177,10 +302,11 @@ struct FitsSchemaItem {
                     "Covariance field has invalid size."
                 );
             }
-            schema.addField< Covariance<float> >(name, doc, units, n);
-        } else {
-            schema.addField< Array<U> >(name, doc, units, size);
+            return boost::make_shared<StandardReader<Covariance<float>>>(
+                col, schema, name, doc, units, size
+            );
         }
+        return boost::make_shared<StandardReader<Array<U>>>(col, schema, name, doc, units, size);
     }
 
 
@@ -242,7 +368,7 @@ struct FitsSchema {
 
 } // anonymous
 
-void FitsReader::_readSchema(
+FitsReader::FieldReaderVector FitsReader::_readSchema(
     Schema & schema,
     daf::base::PropertyList & metadata,
     bool stripMetadata
@@ -384,18 +510,18 @@ void FitsReader::_readSchema(
             if (stripMetadata) metadata.remove(*key);
         }
     }
-    
-    for (
-        FitsSchema::List::const_iterator i = intermediate.asList().begin();
-        i != intermediate.asList().end();
-        ++i
-    ) {
+
+
+    FitsReader::FieldReaderVector fields;
+    fields.reserve(intermediate.asList().size());
+    for (auto i = intermediate.asList().begin(); i != intermediate.asList().end(); ++i) {
         if (i->bit >= 0) {
-            schema.addField<Flag>(i->name, i->doc);
+            fields.push_back(boost::make_shared<FlagReader>(i->bit, schema, i->name, i->doc));
         } else if (i->col != flagCol) {
-            i->addField(schema);
+            fields.push_back(i->addField(schema));
         }
     }
+    return fields;
 }
 
 void FitsReader::_startRecords(BaseTable & table) {
@@ -405,111 +531,50 @@ void FitsReader::_startRecords(BaseTable & table) {
     }
     _row = -1;
     _nRows = _fits->countRows();
-    _processor = boost::make_shared<ProcessRecords>(_fits, _row);
     table.preallocate(_nRows);
 }
 
 PTR(BaseTable) FitsReader::_readTable() {
     PTR(daf::base::PropertyList) metadata = boost::make_shared<daf::base::PropertyList>();
     _fits->readMetadata(*metadata, true);
-    Schema schema(*metadata, true);
+    Schema schema;
+    _fields = _readSchema(schema, *metadata, true);
     PTR(BaseTable) table = BaseTable::make(schema);
     table->setMetadata(metadata);
     _startRecords(*table);
     return table;
 }
 
-// ------------ FITS records reading ------------------------------------------------------------------------
-
-/*
- *  Compared to reading the header, reading the records is pretty easy.  We just
- *  create a Schema::forEach functor (ProcessRecords) and have the schema use
- *  it to iterate over all the fields for each record.  We actually create that
- *  object above, in _readSchema, and then call Schema::forEach in _readRecord.
- *
- *  The driver code is at the bottom of this section; it's easier to understand if you start there
- *  and work your way up.
- */
-
-struct FitsReader::ProcessRecords {
-
-    template <typename T>
-    void operator()(SchemaItem<T> const & item) const {
-        if (col == flagCol) ++col;
-        fits->readTableArray(row, col, item.key.getElementCount(), record->getElement(item.key));
-        ++col;
-    }
-
-    template <typename T>
-    void operator()(SchemaItem< Array<T> > const & item) const {
-        if (col == flagCol) ++col;
-        if (item.key.isVariableLength()) {
-            int size = fits->getTableArraySize(row, col);
-            ndarray::Array<T,1,1> array = ndarray::allocate(size);
-            fits->readTableArray(row, col, size, array.getData());
-            record->set(item.key, array);
-        } else {
-            fits->readTableArray(row, col, item.key.getElementCount(), record->getElement(item.key));
-        }
-        ++col;
-    }
-
-    void operator()(SchemaItem<std::string> const & item) const {
-        if (col == flagCol) ++col;
-        std::string s;
-        fits->readTableScalar(row, col, s);
-        record->set(item.key, s);
-        ++col;
-    }
-
-    void operator()(SchemaItem<Flag> const & item) const {
-        assert(nFlags > 0);
-        assert(flagCol >= 0);
-        record->set(item.key, flags[bit]);
-        ++bit;
-    }
-
-    void apply(Schema const & schema) {
-        col = 0;
-        bit = 0;
-        if (flagCol >= 0) {
-            fits->readTableArray<bool>(row, flagCol, nFlags, flags.get());
-        }
-        schema.forEach(boost::ref(*this));
-    }
-
-    ProcessRecords(Fits * fits_, std::size_t const & row_) :
-        row(row_), col(0), bit(0), nFlags(0), flagCol(-1), fits(fits_)
-    {
-        fits->behavior &= ~ Fits::AUTO_CHECK; // temporarily disable automatic FITS exceptions
-        fits->readKey("FLAGCOL", flagCol);
-        if (fits->status == 0) {
-            --flagCol; // we want 0-indexed column numbers, not FITS' 1-indexed numbers
-            nFlags = fits->getTableArraySize(flagCol);
-            if (nFlags) flags.reset(new bool[nFlags]);
-        } else {
-            fits->status = 0;
-            flagCol = -1;
-        }
-        fits->behavior |= Fits::AUTO_CHECK;
-    }
-
-    std::size_t const & row;  // this is a reference back to the _row data member in FitsReader
-    mutable int col;          // the current column (0-indexed)
-    mutable int bit;          // the current flag bit (in the FITS table, not the Schema)
-    int nFlags;               // the total number of flags
-    int flagCol;              // the column number (0-indexed) that holds all the flag bits
-    Fits * fits;              // the FITS file pointer
-    boost::scoped_array<bool> flags;  // space to hold a bool array of the flags to pass to cfitsio
-    BaseRecord * record;      // record to write values to
-};
-
 PTR(BaseRecord) FitsReader::_readRecord(PTR(BaseTable) const & table) {
+
+    // Create empty record, return it if we're at the end already.
     PTR(BaseRecord) record;
     if (++_row == _nRows) return record;
     record = table->makeRecord();
-    _processor->record = record.get();
-    _processor->apply(table->getSchema());
+
+    // Read all flags into an array of bool.
+    // Most of this should be done once per table, not once per record.
+    _fits->behavior &= ~ Fits::AUTO_CHECK; // temporarily disable automatic FITS exceptions
+    int flagCol = -1;
+    _fits->readKey("FLAGCOL", flagCol);
+    boost::scoped_array<bool> flagData;
+    if (_fits->status == 0) {
+        --flagCol; // we want 0-indexed column numbers, not FITS' 1-indexed numbers
+        int nFlags = _fits->getTableArraySize(flagCol);
+        if (nFlags) {
+            flagData.reset(new bool[nFlags]);
+            _fits->readTableArray<bool>(_row, flagCol, nFlags, flagData.get());
+        }
+    } else {
+        _fits->status = 0;
+        flagCol = -1;
+    }
+    _fits->behavior |= Fits::AUTO_CHECK;
+
+    // Read fields into the record.
+    for (auto iter = _fields.begin(); iter != _fields.end(); ++iter) {
+        (**iter).readCell(_row, *record, *_fits, flagData);
+    }
     return record;
 }
 
@@ -532,6 +597,8 @@ static FitsReader::FactoryT<FitsReader> baseReaderFactory("BASE");
 FitsReader::Factory::Factory(std::string const & name) {
     getRegistry()[name] = this;
 }
+
+FitsReader::~FitsReader() {}
 
 PTR(FitsReader) FitsReader::make(Fits * fits, PTR(io::InputArchive) archive, int flags) {
     std::string name;
