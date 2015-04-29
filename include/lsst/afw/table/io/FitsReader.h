@@ -4,7 +4,6 @@
 
 #include "lsst/afw/fits.h"
 #include "lsst/afw/table/Schema.h"
-#include "lsst/afw/table/io/Reader.h"
 #include "lsst/afw/table/io/InputArchive.h"
 
 namespace lsst { namespace afw { namespace table { namespace io {
@@ -27,11 +26,11 @@ class FieldReader;
  *  try to load a non-Source FITS table into a SourceCatalog, you'll get an exception
  *  when it tries to dynamic_cast the table to a SourceTable.
  */
-class FitsReader : public Reader {
+class FitsReader {
 public:
 
     typedef afw::fits::Fits Fits;
-    
+
     /**
      *  @brief Factory class used to construct FitsReaders.
      *
@@ -85,7 +84,7 @@ public:
      *  @brief Entry point for reading FITS files into arbitrary containers.
      *
      *  This does the work of opening the file, calling FitsReader::make, and then calling
-     *  Reader::read.
+     *  FitsReader::_read.
      */
     template <typename ContainerT, typename SourceT>
     static ContainerT apply(SourceT & source, int hdu, int flags) {
@@ -98,14 +97,14 @@ public:
     template <typename ContainerT>
     static ContainerT apply(Fits & fits, PTR(io::InputArchive) archive=PTR(io::InputArchive)(), int flags=0) {
         PTR(FitsReader) reader = make(&fits, archive, flags);
-        return reader->template read<ContainerT>();
+        return reader->template _read<ContainerT>();
     }
 
     /// @brief Low-level entry point for reading FITS files into arbitrary containers.
     template <typename ContainerT>
     static ContainerT apply(Fits & fits, int flags=0) {
         PTR(FitsReader) reader = make(&fits, PTR(io::InputArchive)(), flags);
-        return reader->template read<ContainerT>();
+        return reader->template _read<ContainerT>();
     }
 
     /**
@@ -119,12 +118,64 @@ public:
 
     ~FitsReader(); // needs to go in .cc so it can see FieldReader dtor
 
+private:
+
+    /**
+     *  @brief Load an on-disk table into a container.
+     *
+     *  The container must be a specialized table container (like CatalogT):
+     *   - It must be constructable from a single table shared_ptr argument.
+     *   - It must have an insert member function that takes an position
+     *     iterator and a record shared_ptr.
+     */
+    template <typename ContainerT>
+    ContainerT _read() {
+    #if 1
+        // Work around a clang++ version 3.0 (tags/Apple/clang-211.12) bug with shared_ptr reference counts
+        PTR(typename ContainerT::Table) table;
+        {
+            PTR(BaseTable) tmpTable = _readTable();
+            table = boost::dynamic_pointer_cast<typename ContainerT::Table>(tmpTable);
+        }
+    #else
+        PTR(typename ContainerT::Table) table
+            = boost::dynamic_pointer_cast<typename ContainerT::Table>(_readTable());
+    #endif
+        if (!table) {
+            throw LSST_EXCEPT(
+                lsst::pex::exceptions::RuntimeError,
+                "Container's table type is not compatible with on-disk table type."
+            );
+        }
+        ContainerT container(table);
+        PTR(BaseRecord) record = _readRecord(table);
+        while (record) {
+            container.insert(
+                container.end(),
+                boost::static_pointer_cast<typename ContainerT::Record>(record)
+            );
+            record = _readRecord(table);
+        }
+        return container;
+    }
+
+
 protected:
 
-    /// @copydoc Reader::_readTable
+    /**
+     *  @brief Create a new table of the appropriate type.
+     *
+     *  The result may be an instance of a subclass of BaseTable.
+     */
     virtual PTR(BaseTable) _readTable();
 
-    /// @copydoc Reader::_readRecord
+    /**
+     *  @brief Read an individual record, creating it with the given table.
+     *
+     *  The result may be an instance of a subclass of BaseRecord.  The table will have just been loaded
+     *  with _readSchema; these are separated in order to allow subclasses to delegate to base
+     *  class implementations more effectively.
+     */
     virtual PTR(BaseRecord) _readRecord(PTR(BaseTable) const & table);
 
     /// @brief Should be called by any reimplementation of _readTable.
